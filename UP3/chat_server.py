@@ -156,10 +156,12 @@ class Server:
 #             retrieve a sonnet : IMPLEMENT THIS
 # ==============================================================================
             elif msg["action"] == "poem":
-                poem_idx = int(msg["target"])
-                poem = self.sonnet.get_poem(poem_idx)
-                # Join the list of lines into a single string
-                poem = "\n".join(poem)
+                try:
+                    poem_idx = int(msg["target"])
+                    poem = self.sonnet.get_poem(poem_idx)
+                    poem = "\n".join(poem)
+                except:
+                    poem = ""
                 mysend(from_sock, json.dumps({"action": "poem", "results": poem}))
 # ==============================================================================
 #                 time
