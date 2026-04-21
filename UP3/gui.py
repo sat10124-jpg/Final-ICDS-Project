@@ -82,7 +82,8 @@ class ChatGUI:
         for label, cmd in [("Who's Online", self._who),
                             ("Connect",      self._connect_peer),
                             ("Time",         self._time),
-                            ("Disconnect",   self._disconnect_peer)]:
+                            ("Disconnect",   self._disconnect_peer),
+                            ("Clear Chat",   self._clear_chat)]:
             tk.Button(btn_frame, text=label, font=("Arial", 9),
                       bg="#e0e0e0", relief=tk.FLAT, padx=8, pady=4,
                       cursor="hand2", command=cmd).pack(side=tk.LEFT, padx=3)
@@ -248,6 +249,12 @@ class ChatGUI:
             self._append("system", "User is busy, try again later.\n")
         else:
             self._append("system", "User is not online.\n")
+
+    def _clear_chat(self):
+        """Clears all messages from the chat display. Generated with pi-mono."""
+        self.chat_display.config(state="normal")
+        self.chat_display.delete('1.0', 'end')
+        self.chat_display.config(state="disabled")
 
     def _disconnect_peer(self):
         if self.state == S_CHATTING:
