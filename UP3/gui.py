@@ -43,7 +43,8 @@ class ChatGUI:
         self.state = S_LOGGEDIN
         self.running = False
         self.msg_queue = queue.Queue()
-        self.sock_lock = threading.Lock()  # single mutex for all socket access
+        self.response_queue = queue.Queue()
+        self.sock_lock = threading.Lock()  # protects socket writes only
         self.bot = ChatBotClient(name="Bot", model="phi4-mini")
 
         self._build_ui()
@@ -128,26 +129,28 @@ class ChatGUI:
             try:
                 read, _, _ = select.select([self.s], [], [], 0.2)
                 if self.s in read:
-                    acquired = self.sock_lock.acquire(timeout=0.1)
-                    if acquired:
-                        try:
-                            raw = myrecv(self.s)
-                            if raw:
-                                self.msg_queue.put(raw)
-                        finally:
-                            self.sock_lock.release()
+                    raw = myrecv(self.s)
+                    if raw:
+                        msg = json.loads(raw)
+                        action = msg.get("action")
+                        # Incoming peer pushes go to msg_queue; command responses go to response_queue
+                        if (action in ("exchange", "disconnect") or
+                                (action == "connect" and msg.get("status") == "request")):
+                            self.msg_queue.put(raw)
+                        else:
+                            self.response_queue.put(raw)
             except:
                 break
 
     def _send_cmd(self, action_json):
-        """Send a command and get the response, holding the mutex the whole time."""
-        with self.sock_lock:
-            try:
+        """Send a command and wait for the response via the response queue."""
+        try:
+            with self.sock_lock:
                 mysend(self.s, action_json)
-                resp = myrecv(self.s)
-                return json.loads(resp)
-            except Exception:
-                return {"results": "", "status": "error"}
+            resp = self.response_queue.get(timeout=5)
+            return json.loads(resp)
+        except Exception:
+            return {"results": "", "status": "error"}
 
     def _process_queue(self):
         while not self.msg_queue.empty():
