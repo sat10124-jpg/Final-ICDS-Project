@@ -1,6 +1,13 @@
 """
 gui.py - Tkinter GUI for the chat client
 Handles all socket communication directly to avoid threading conflicts.
+
+Enhanced with:
+  - AI Picture Generation (/aipic: <prompt>)
+  - NLP Chat Summary (/summary) and Keyword Extraction (/keywords)
+  - Sentiment analysis on all messages
+  - Collapsible + menu for utility commands
+  - Polished slate/indigo dark color scheme
 """
 
 import threading
@@ -14,28 +21,127 @@ from chat_utils import *
 from chat_bot_client import ChatBotClient
 from textblob import TextBlob
 
+import re
+import string
+from collections import Counter
 
-def get_sentiment(text):
-    polarity = TextBlob(text).sentiment.polarity
-    if polarity > 0.1:
-        return "😊 Positive"
-    elif polarity < -0.1:
-        return "😡 Negative"
-    else:
-        return "😐 Neutral"
+try:
+    import nltk
+    for _pkg in ("punkt", "stopwords", "punkt_tab"):
+        try:
+            nltk.data.find(f"tokenizers/{_pkg}" if _pkg.startswith("punkt") else f"corpora/{_pkg}")
+        except LookupError:
+            nltk.download(_pkg, quiet=True)
+    from nltk.corpus import stopwords
+    from nltk.tokenize import word_tokenize, sent_tokenize
+    NLTK_OK = True
+except Exception:
+    NLTK_OK = False
+
+try:
+    from PIL import Image, ImageTk
+    import urllib.request
+    import urllib.parse
+    import io
+    PIL_OK = True
+except ImportError:
+    PIL_OK = False
 
 
-# States
+# ── Color palette (deep slate + indigo) ──────────────────────────────────────
+C = {
+    "bg_app":    "#1a1d2e",
+    "bg_header": "#222640",
+    "bg_chat":   "#141624",
+    "bg_input":  "#222640",
+    "bg_panel":  "#1a1d2e",
+    "accent":    "#6c63ff",
+    "green":     "#22c55e",
+    "amber":     "#f59e0b",
+    "purple":    "#a855f7",
+    "border":    "#2d3158",
+    "popup_bg":  "#252945",
+    "txt_main":  "#e2e4f0",
+    "txt_muted": "#7b82a8",
+    "txt_me":    "#818cf8",
+    "txt_peer":  "#f87171",
+    "txt_sys":   "#94a3b8",
+    "txt_bot":   "#c084fc",
+    "txt_nlp":   "#4ade80",
+    "txt_pic":   "#fb923c",
+}
+
 S_LOGGEDIN = 1
 S_CHATTING = 2
+
+
+def get_sentiment(text):
+    p = TextBlob(text).sentiment.polarity
+    return "😊 Positive" if p > 0.1 else ("😡 Negative" if p < -0.1 else "😐 Neutral")
+
+
+def extract_keywords(messages, top_n=10):
+    combined = " ".join(messages).lower().translate(str.maketrans("", "", string.punctuation))
+    if NLTK_OK:
+        tokens = word_tokenize(combined)
+        stops = set(stopwords.words("english"))
+    else:
+        tokens = combined.split()
+        stops = {"i","me","my","we","our","you","your","he","she","it","they","their",
+                 "this","that","is","are","was","were","be","been","have","has","had",
+                 "do","does","did","will","would","could","should","a","an","the",
+                 "and","but","or","so","if","in","on","at","to","for","of","with",
+                 "by","from","as","up","not","no","just","ok","okay","yeah"}
+    words = [w for w in tokens if w.isalpha() and w not in stops and len(w) > 2]
+    return Counter(words).most_common(top_n)
+
+
+def generate_summary(messages, num_sentences=3):
+    if not messages:
+        return "No messages to summarize."
+    combined = " ".join(messages)
+    sents = sent_tokenize(combined) if NLTK_OK else re.split(r'(?<=[.!?])\s+', combined)
+    if len(sents) <= num_sentences:
+        return combined
+    kws = {w for w, _ in extract_keywords(messages, top_n=20)}
+    scores = {i: sum(1 for w in s.lower().split() if w in kws) for i, s in enumerate(sents)}
+    top = sorted(sorted(scores, key=scores.get, reverse=True)[:num_sentences])
+    return " ".join(sents[i] for i in top)
+
+
+def fetch_ai_image(prompt, width=400, height=300):
+    if not PIL_OK:
+        return None, "Install Pillow: pip install Pillow"
+    try:
+        url = f"https://image.pollinations.ai/prompt/{urllib.parse.quote(prompt)}?width={width}&height={height}&nologo=true"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = r.read()
+        img = Image.open(io.BytesIO(data))
+        img.thumbnail((400, 300), Image.LANCZOS)
+        return ImageTk.PhotoImage(img), None
+    except Exception as e:
+        return None, str(e)
+
+
+def mk_btn(parent, text, cmd, bg, fg="#ffffff", font_size=10, padx=12):
+    """Uniform flat button factory."""
+    return tk.Button(
+        parent, text=text, command=cmd,
+        bg=bg, fg=fg, activebackground=bg, activeforeground=fg,
+        font=("Segoe UI", font_size, "bold"),
+        relief=tk.FLAT, bd=0, cursor="hand2",
+        padx=padx, pady=0, height=1,
+    )
 
 
 class ChatGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("Chat App")
-        self.root.geometry("520x620")
-        self.root.configure(bg="#f0f0f0")
+        self.root.title("💬  Chat")
+        self.root.geometry("600x700")
+        self.root.configure(bg=C["bg_app"])
+        self.root.resizable(True, True)
 
         self.s = None
         self.me = ""
@@ -44,61 +150,135 @@ class ChatGUI:
         self.running = False
         self.msg_queue = queue.Queue()
         self.response_queue = queue.Queue()
-        self.sock_lock = threading.Lock()  # protects socket writes only
+        self.sock_lock = threading.Lock()
         self.bot = ChatBotClient(name="Bot", model="phi4-mini")
+        self.chat_history = []
+        self._image_refs = []
+        self._menu_visible = False
 
         self._build_ui()
         self._login()
 
+    # ── UI Build ──────────────────────────────────────────────────────────────
+
     def _build_ui(self):
+        # Status bar
         self.status_var = tk.StringVar(value="Not connected")
         tk.Label(self.root, textvariable=self.status_var,
-                 bg="#4a90d9", fg="white", font=("Arial", 10, "bold"),
-                 anchor="w", padx=10, pady=4).pack(fill=tk.X)
+                 bg=C["bg_header"], fg=C["txt_muted"],
+                 font=("Segoe UI", 9), anchor="w", padx=14, pady=7
+                 ).pack(fill=tk.X)
 
+        # Chat display
         self.chat_display = scrolledtext.ScrolledText(
             self.root, state="disabled", wrap=tk.WORD,
-            bg="white", fg="#222", font=("Arial", 11),
-            relief=tk.FLAT, padx=8, pady=8)
-        self.chat_display.pack(fill=tk.BOTH, expand=True, padx=10, pady=(10, 4))
+            bg=C["bg_chat"], fg=C["txt_main"],
+            font=("Segoe UI", 11), insertbackground=C["txt_main"],
+            relief=tk.FLAT, bd=0, padx=14, pady=12,
+            selectbackground=C["accent"], selectforeground="#ffffff",
+        )
+        self.chat_display.pack(fill=tk.BOTH, expand=True)
 
-        self.chat_display.tag_config("me",     foreground="#1a73e8", font=("Arial", 11, "bold"))
-        self.chat_display.tag_config("peer",   foreground="#e53935", font=("Arial", 11, "bold"))
-        self.chat_display.tag_config("system", foreground="#555",    font=("Arial", 10, "italic"))
-        self.chat_display.tag_config("bot",    foreground="#6a0dad", font=("Arial", 11, "bold"))
+        self.chat_display.tag_config("me",     foreground=C["txt_me"],   font=("Segoe UI", 11, "bold"))
+        self.chat_display.tag_config("peer",   foreground=C["txt_peer"], font=("Segoe UI", 11, "bold"))
+        self.chat_display.tag_config("system", foreground=C["txt_sys"],  font=("Segoe UI", 10, "italic"))
+        self.chat_display.tag_config("bot",    foreground=C["txt_bot"],  font=("Segoe UI", 11, "bold"))
+        self.chat_display.tag_config("nlp",    foreground=C["txt_nlp"],  font=("Segoe UI", 10, "italic"))
+        self.chat_display.tag_config("aipic",  foreground=C["txt_pic"],  font=("Segoe UI", 10, "bold"))
 
-        bottom = tk.Frame(self.root, bg="#f0f0f0")
-        bottom.pack(fill=tk.X, padx=10, pady=(0, 6))
-        self.msg_input = tk.Entry(bottom, font=("Arial", 12), relief=tk.SOLID, bd=1)
-        self.msg_input.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=6)
+        # ── Collapsible utility menu ──────────────────────────────────────────
+        self._menu_frame = tk.Frame(self.root, bg=C["popup_bg"], pady=6, padx=8)
+        for label, cmd in [
+            ("Who's Online", self._who),
+            ("Connect",      self._connect_peer),
+            ("Time",         self._time),
+            ("Disconnect",   self._disconnect_peer),
+            ("Clear Chat",   self._clear_chat),
+        ]:
+            mk_btn(self._menu_frame, label, cmd, bg=C["bg_header"], padx=10
+                   ).pack(side=tk.LEFT, padx=3, pady=2, ipady=5)
+
+        # ── Separator ────────────────────────────────────────────────────────
+        tk.Frame(self.root, bg=C["border"], height=1).pack(fill=tk.X)
+
+        # ── Bottom panel ──────────────────────────────────────────────────────
+        panel = tk.Frame(self.root, bg=C["bg_panel"], pady=10, padx=10)
+        panel.pack(fill=tk.X)
+
+        # Row 1 — main message input
+        r1 = tk.Frame(panel, bg=C["bg_panel"])
+        r1.pack(fill=tk.X, pady=(0, 8))
+
+        self._plus_btn = mk_btn(r1, "+", self._toggle_menu,
+                                bg=C["bg_input"], fg=C["txt_muted"], padx=10)
+        self._plus_btn.pack(side=tk.LEFT, ipady=7)
+        tk.Frame(r1, bg=C["border"], width=1).pack(side=tk.LEFT, fill=tk.Y, padx=5)
+
+        self.msg_input = tk.Entry(
+            r1, font=("Segoe UI", 12),
+            bg=C["bg_input"], fg=C["txt_main"],
+            insertbackground=C["txt_main"],
+            relief=tk.FLAT, bd=0,
+        )
+        self.msg_input.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=7, padx=(2, 8))
         self.msg_input.bind("<Return>", lambda e: self._send_message())
-        tk.Button(bottom, text="Send", font=("Arial", 11, "bold"),
-                  bg="#4a90d9", fg="white", relief=tk.FLAT,
-                  padx=14, pady=6, cursor="hand2",
-                  command=self._send_message).pack(side=tk.LEFT, padx=(6, 0))
 
-        btn_frame = tk.Frame(self.root, bg="#f0f0f0")
-        btn_frame.pack(fill=tk.X, padx=10, pady=(0, 6))
-        for label, cmd in [("Who's Online", self._who),
-                            ("Connect",      self._connect_peer),
-                            ("Time",         self._time),
-                            ("Disconnect",   self._disconnect_peer),
-                            ("Clear Chat",   self._clear_chat)]:
-            tk.Button(btn_frame, text=label, font=("Arial", 9),
-                      bg="#e0e0e0", relief=tk.FLAT, padx=8, pady=4,
-                      cursor="hand2", command=cmd).pack(side=tk.LEFT, padx=3)
+        mk_btn(r1, "Send ▶", self._send_message,
+               bg=C["accent"], padx=18, font_size=10
+               ).pack(side=tk.LEFT, ipady=7)
 
-        bot_frame = tk.Frame(self.root, bg="#f0f0f0")
-        bot_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
-        tk.Label(bot_frame, text="🤖 Chatbot:", font=("Arial", 9, "bold"),
-                 bg="#f0f0f0").pack(side=tk.LEFT, padx=(0, 4))
-        self.bot_input = tk.Entry(bot_frame, font=("Arial", 11), relief=tk.SOLID, bd=1)
-        self.bot_input.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=4)
+        # Row 2 — NLP | AI Pic | Bot (uniform height via ipady)
+        r2 = tk.Frame(panel, bg=C["bg_panel"])
+        r2.pack(fill=tk.X)
+
+        # NLP
+        tk.Label(r2, text="NLP", bg=C["bg_panel"], fg=C["txt_muted"],
+                 font=("Segoe UI", 8, "bold")).pack(side=tk.LEFT, padx=(0, 3))
+        mk_btn(r2, "Summary",  self._nlp_summary,  bg=C["green"],  padx=10).pack(side=tk.LEFT, ipady=7, padx=(0, 3))
+        mk_btn(r2, "Keywords", self._nlp_keywords, bg=C["green"],  padx=10).pack(side=tk.LEFT, ipady=7, padx=(0, 12))
+
+        # AI Pic
+        tk.Label(r2, text="AI Pic", bg=C["bg_panel"], fg=C["txt_muted"],
+                 font=("Segoe UI", 8, "bold")).pack(side=tk.LEFT, padx=(0, 3))
+        self.aipic_input = tk.Entry(
+            r2, font=("Segoe UI", 11),
+            bg=C["bg_input"], fg=C["txt_main"],
+            insertbackground=C["txt_main"],
+            relief=tk.FLAT, bd=0, width=13,
+        )
+        self.aipic_input.pack(side=tk.LEFT, ipady=7, padx=(0, 4))
+        self.aipic_input.bind("<Return>", lambda e: self._generate_ai_pic())
+        mk_btn(r2, "Generate", self._generate_ai_pic, bg=C["amber"], padx=10).pack(side=tk.LEFT, ipady=7, padx=(0, 12))
+
+        # Bot
+        tk.Label(r2, text="Bot", bg=C["bg_panel"], fg=C["txt_muted"],
+                 font=("Segoe UI", 8, "bold")).pack(side=tk.LEFT, padx=(0, 3))
+        self.bot_input = tk.Entry(
+            r2, font=("Segoe UI", 11),
+            bg=C["bg_input"], fg=C["txt_main"],
+            insertbackground=C["txt_main"],
+            relief=tk.FLAT, bd=0, width=13,
+        )
+        self.bot_input.pack(side=tk.LEFT, ipady=7, padx=(0, 4))
         self.bot_input.bind("<Return>", lambda e: self._ask_bot())
-        tk.Button(bot_frame, text="Ask", font=("Arial", 10, "bold"),
-                  bg="#6a0dad", fg="white", relief=tk.FLAT,
-                  padx=10, pady=4, cursor="hand2",
-                  command=self._ask_bot).pack(side=tk.LEFT, padx=(6, 0))
+        mk_btn(r2, "Ask 🤖", self._ask_bot, bg=C["purple"], padx=10).pack(side=tk.LEFT, ipady=7)
+
+    # ── + Menu toggle ─────────────────────────────────────────────────────────
+
+    def _toggle_menu(self):
+        if self._menu_visible:
+            self._menu_frame.pack_forget()
+            self._plus_btn.config(text="+")
+            self._menu_visible = False
+        else:
+            # Place just above the separator (which is above the panel)
+            slaves = self.root.pack_slaves()
+            sep_index = slaves.index(self.root.pack_slaves()[-2])
+            self._menu_frame.pack(fill=tk.X, before=slaves[-2])
+            self._plus_btn.config(text="✕")
+            self._menu_visible = True
+
+    # ── Login ─────────────────────────────────────────────────────────────────
 
     def _login(self):
         name = simpledialog.askstring("Login", "Enter your username:", parent=self.root)
@@ -112,7 +292,8 @@ class ChatGUI:
             resp = json.loads(myrecv(self.s))
             if resp["status"] == "ok":
                 self.me = name
-                self._append("system", f"Welcome, {name}! Use the buttons below.\n")
+                self._append("system", f"Welcome, {name}! Press + for commands.\n")
+                self._append("system", "Tips: /aipic: <prompt>  |  /summary  |  /keywords\n")
                 self._update_status()
                 self.running = True
                 threading.Thread(target=self._recv_loop, daemon=True).start()
@@ -124,6 +305,8 @@ class ChatGUI:
             messagebox.showerror("Connection Error", str(e))
             self.root.destroy()
 
+    # ── Network ───────────────────────────────────────────────────────────────
+
     def _recv_loop(self):
         import select
         while self.running:
@@ -134,7 +317,6 @@ class ChatGUI:
                     if raw:
                         msg = json.loads(raw)
                         action = msg.get("action")
-                        # Incoming peer pushes go to msg_queue; command responses go to response_queue
                         if (action in ("exchange", "disconnect") or
                                 (action == "connect" and msg.get("status") == "request")):
                             self.msg_queue.put(raw)
@@ -144,7 +326,6 @@ class ChatGUI:
                 break
 
     def _send_cmd(self, action_json):
-        """Send a command and wait for the response via the response queue."""
         try:
             with self.sock_lock:
                 mysend(self.s, action_json)
@@ -162,13 +343,13 @@ class ChatGUI:
                 if action == "exchange":
                     text = msg.get("message", "")
                     sender = msg.get("from", "peer")
-                    sentiment = get_sentiment(text)
-                    self._append("peer", f"{sender}: {text}  {sentiment}\n")
+                    self._append("peer", f"{sender}: {text}  {get_sentiment(text)}\n")
+                    self.chat_history.append(text)
                 elif action == "connect":
                     self.peer = msg.get("from", "")
                     self.state = S_CHATTING
                     self._append("system", f"Request from {self.peer}\n")
-                    self._append("system", f"You are connected with {self.peer}. Chat away!\n")
+                    self._append("system", f"Connected with {self.peer}. Chat away!\n")
                     self._update_status()
                 elif action == "disconnect":
                     self._append("system", msg.get("msg", "Peer disconnected") + "\n")
@@ -180,15 +361,31 @@ class ChatGUI:
         if self.running:
             self.root.after(100, self._process_queue)
 
+    # ── Send message ──────────────────────────────────────────────────────────
+
     def _send_message(self):
         msg = self.msg_input.get().strip()
         if not msg:
             return
         self.msg_input.delete(0, tk.END)
 
+        if msg.lower().startswith("/aipic:"):
+            prompt = msg[7:].strip()
+            if prompt:
+                self.aipic_input.delete(0, tk.END)
+                self.aipic_input.insert(0, prompt)
+                self._generate_ai_pic()
+            else:
+                self._append("system", "Usage: /aipic: <your prompt>\n")
+            return
+        if msg.lower() == "/summary":
+            self._nlp_summary(); return
+        if msg.lower() == "/keywords":
+            self._nlp_keywords(); return
+
         if self.state == S_CHATTING:
-            sentiment = get_sentiment(msg)
-            self._append("me", f"[{self.me}]: {msg}  {sentiment}\n")
+            self._append("me", f"[{self.me}]: {msg}  {get_sentiment(msg)}\n")
+            self.chat_history.append(msg)
             with self.sock_lock:
                 mysend(self.s, json.dumps({"action": "exchange", "from": f"[{self.me}]", "message": msg}))
             if msg == "bye":
@@ -204,10 +401,7 @@ class ChatGUI:
             try:
                 resp = self._send_cmd(json.dumps({"action": "search", "target": term}))
                 result = resp.get("results", "").strip()
-                if result:
-                    self._append("system", result + "\n")
-                else:
-                    self._append("system", f"'{term}' not found\n")
+                self._append("system", result + "\n" if result else f"'{term}' not found\n")
             except:
                 self._append("system", f"'{term}' not found\n")
 
@@ -215,45 +409,44 @@ class ChatGUI:
             try:
                 resp = self._send_cmd(json.dumps({"action": "poem", "target": msg[1:]}))
                 poem = resp.get("results", "").strip()
-                if poem:
-                    self._append("system", poem + "\n")
-                else:
-                    self._append("system", f"Sonnet {msg[1:]} not found.\n")
+                self._append("system", poem + "\n" if poem else f"Sonnet {msg[1:]} not found.\n")
             except:
                 self._append("system", f"Sonnet {msg[1:]} not found.\n")
-
         else:
-            self._append("system", "Use the buttons above, or type:\n  ?term  → search\n  p#  → get sonnet\n")
+            self._append("system",
+                "?term → search  |  p# → sonnet  |  /aipic: prompt  |  /summary  |  /keywords\n")
+
+    # ── Utility actions ───────────────────────────────────────────────────────
 
     def _who(self):
         resp = self._send_cmd(json.dumps({"action": "list"}))
-        self._append("system", "Users online:\n" + resp["results"] + "\n")
+        self._append("system", "Online:\n" + resp.get("results", "") + "\n")
 
     def _time(self):
         resp = self._send_cmd(json.dumps({"action": "time"}))
-        self._append("system", "Time is: " + resp["results"] + "\n")
+        self._append("system", "Time: " + resp.get("results", "") + "\n")
 
     def _connect_peer(self):
-        peer = simpledialog.askstring("Connect", "Enter username to connect to:", parent=self.root)
+        peer = simpledialog.askstring("Connect", "Username to connect to:", parent=self.root)
         if not peer:
             return
         resp = self._send_cmd(json.dumps({"action": "connect", "target": peer}))
-        if resp["status"] == "success":
-            self.peer = peer
-            self.state = S_CHATTING
+        s = resp.get("status", "")
+        if s == "success":
+            self.peer = peer; self.state = S_CHATTING
             self._append("system", f"Connected to {peer}. Chat away!\n")
             self._update_status()
-        elif resp["status"] == "self":
+        elif s == "self":
             self._append("system", "Cannot connect to yourself!\n")
-        elif resp["status"] == "busy":
-            self._append("system", "User is busy, try again later.\n")
+        elif s == "busy":
+            self._append("system", "User is busy.\n")
         else:
-            self._append("system", "User is not online.\n")
+            self._append("system", "User not online.\n")
 
     def _clear_chat(self):
         """Clears all messages from the chat display. Generated with pi-mono."""
         self.chat_display.config(state="normal")
-        self.chat_display.delete('1.0', 'end')
+        self.chat_display.delete("1.0", "end")
         self.chat_display.config(state="disabled")
 
     def _disconnect_peer(self):
@@ -261,11 +454,12 @@ class ChatGUI:
             with self.sock_lock:
                 mysend(self.s, json.dumps({"action": "disconnect"}))
             self._append("system", f"Disconnected from {self.peer}.\n")
-            self.state = S_LOGGEDIN
-            self.peer = ""
+            self.state = S_LOGGEDIN; self.peer = ""
             self._update_status()
         else:
-            self._append("system", "You are not currently chatting.\n")
+            self._append("system", "Not currently chatting.\n")
+
+    # ── Chatbot ───────────────────────────────────────────────────────────────
 
     def _ask_bot(self):
         msg = self.bot_input.get().strip()
@@ -273,7 +467,7 @@ class ChatGUI:
             return
         self.bot_input.delete(0, tk.END)
         self._append("me", f"[You → Bot]: {msg}\n")
-        self._append("system", "Bot is thinking...\n")
+        self._append("system", "Bot is thinking…\n")
 
         def run():
             try:
@@ -284,6 +478,51 @@ class ChatGUI:
 
         threading.Thread(target=run, daemon=True).start()
 
+    # ── NLP ───────────────────────────────────────────────────────────────────
+
+    def _nlp_summary(self):
+        if not self.chat_history:
+            self._append("nlp", "📝 No chat history yet.\n"); return
+        self._append("nlp", f"📝 Summary:\n{generate_summary(self.chat_history)}\n")
+
+    def _nlp_keywords(self):
+        if not self.chat_history:
+            self._append("nlp", "🔑 No chat history yet.\n"); return
+        kws = extract_keywords(self.chat_history)
+        if not kws:
+            self._append("nlp", "🔑 No keywords found.\n"); return
+        self._append("nlp", "🔑 Keywords: " + "  ".join(f"{w}({c})" for w, c in kws) + "\n")
+
+    # ── AI Pic ────────────────────────────────────────────────────────────────
+
+    def _generate_ai_pic(self):
+        prompt = self.aipic_input.get().strip()
+        if not prompt:
+            self._append("aipic", "🎨 Enter a prompt first.\n"); return
+        self.aipic_input.delete(0, tk.END)
+        if not PIL_OK:
+            self._append("aipic", "🎨 Install Pillow: pip install Pillow\n"); return
+        self._append("aipic", f"🎨 Generating \"{prompt}\"…\n")
+
+        def run():
+            photo, err = fetch_ai_image(prompt)
+            if err:
+                self.root.after(0, self._append, "aipic", f"🎨 Failed: {err}\n")
+                return
+            def show():
+                self._image_refs.append(photo)
+                self.chat_display.config(state="normal")
+                self.chat_display.insert(tk.END, f"🎨 \"{prompt}\":\n", "aipic")
+                self.chat_display.image_create(tk.END, image=photo)
+                self.chat_display.insert(tk.END, "\n\n")
+                self.chat_display.config(state="disabled")
+                self.chat_display.see(tk.END)
+            self.root.after(0, show)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
     def _append(self, tag, msg):
         self.chat_display.config(state="normal")
         self.chat_display.insert(tk.END, msg if msg.endswith("\n") else msg + "\n", tag)
@@ -292,9 +531,9 @@ class ChatGUI:
 
     def _update_status(self):
         if self.state == S_CHATTING:
-            self.status_var.set(f"Logged in as: {self.me}  |  Chatting with: {self.peer}")
+            self.status_var.set(f"  {self.me}  ·  chatting with {self.peer}")
         else:
-            self.status_var.set(f"Logged in as: {self.me}  |  Not chatting")
+            self.status_var.set(f"  {self.me}  ·  idle")
 
 
 def main():
