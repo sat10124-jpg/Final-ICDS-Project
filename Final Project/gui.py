@@ -13,12 +13,20 @@ import time
 import json
 import queue
 import socket as sock_module
+import urllib.request
+import urllib.parse
+import io
 import tkinter as tk
 from tkinter import font, ttk, simpledialog, messagebox, scrolledtext
+from PIL import Image, ImageTk
 from chat_utils import *
 from client_state_machine import ClientSM
 from chat_bot_client import ChatBotClient
 from textblob import TextBlob
+import nltk
+from nltk.corpus import stopwords
+from nltk.tokenize import word_tokenize
+from collections import Counter
 
 
 def get_sentiment(text):
@@ -41,6 +49,48 @@ def clear_chat(text_widget):
     text_widget.config(state=tk.DISABLED)
 
 
+def extract_keywords(messages, top_n=8):
+    """Extract top keywords from a list of chat messages using NLTK."""
+    stop_words = set(stopwords.words('english'))
+    # Add chat-specific stop words
+    stop_words.update(['bye', 'hello', 'hi', 'hey', 'ok', 'okay', 'yes', 'no', 'lol'])
+    all_words = []
+    for msg in messages:
+        tokens = word_tokenize(msg.lower())
+        words = [w for w in tokens if w.isalpha() and w not in stop_words and len(w) > 2]
+        all_words.extend(words)
+    if not all_words:
+        return []
+    return Counter(all_words).most_common(top_n)
+
+
+def generate_summary(messages):
+    """Generate a simple summary of chat messages using sentence scoring."""
+    if not messages:
+        return "No messages to summarize."
+    stop_words = set(stopwords.words('english'))
+    # Score each message by how many non-stop words it contains
+    scored = []
+    for msg in messages:
+        tokens = word_tokenize(msg.lower())
+        score = sum(1 for w in tokens if w.isalpha() and w not in stop_words)
+        scored.append((score, msg))
+    scored.sort(reverse=True)
+    # Return top 3 most content-rich messages as summary
+    top = [msg for _, msg in scored[:3]]
+    return " | ".join(top)
+
+
+def generate_image(prompt):
+    """Generate an image using Pollinations AI (free, no API key needed).
+    Returns a PIL Image object."""
+    encoded = urllib.parse.quote(prompt)
+    url = f"https://image.pollinations.ai/prompt/{encoded}?width=400&height=400&nologo=true"
+    with urllib.request.urlopen(url, timeout=30) as response:
+        image_data = response.read()
+    return Image.open(io.BytesIO(image_data))
+
+
 # States (mirroring chat_utils)
 S_LOGGEDIN = 1
 S_CHATTING = 2
@@ -61,6 +111,7 @@ class GUI:
         self.my_msg = ""
         self.system_msg = ""   # BUG FIX: will use = not += when updating
         self.bot = ChatBotClient(name="Bot", model="phi4-mini")
+        self.chat_history = []  # stores all chat messages for NLP analysis
 
         # Two queues: peer pushes vs command responses
         self.msg_queue = queue.Queue()
@@ -205,7 +256,7 @@ class GUI:
 
         # Tip label
         tk.Label(self.Window,
-                 text="  ?term = search  |  p# = sonnet  |  bye = disconnect from chat",
+                 text="  ?term=search | p#=sonnet | /keywords | /summary | /aipic: prompt",
                  bg="#0f3460", fg="#aaaaaa", font=("Helvetica", 8),
                  anchor="w").place(relwidth=1, rely=0.94, relheight=0.04)
 
@@ -252,6 +303,7 @@ class GUI:
                     text = msg.get("message", "")
                     sender = msg.get("from", "peer")
                     sentiment = get_sentiment(text)
+                    self.chat_history.append(text)  # track for NLP
                     self._append("peer", f"{sender}: {text}  {sentiment}\n")
                 elif action == "connect":
                     self.peer = msg.get("from", "")
@@ -284,6 +336,7 @@ class GUI:
         if state == S_CHATTING:
             sentiment = get_sentiment(msg)
             self._append("me", f"[{self.sm.get_myname()}]: {msg}  {sentiment}\n")
+            self.chat_history.append(msg)  # track for NLP
             mysend(self.socket, json.dumps({"action": "exchange",
                                             "from": f"[{self.sm.get_myname()}]",
                                             "message": msg}))
@@ -292,6 +345,40 @@ class GUI:
                 self.sm.set_state(S_LOGGEDIN)
                 self.sm.peer = ""
                 self._update_status()
+
+        elif msg.startswith("/aipic:"):
+            prompt = msg[7:].strip()
+            if not prompt:
+                self._append("system", "Usage: /aipic: your image description\n")
+            else:
+                self._append("system", f"🎨 Generating image: '{prompt}'... please wait\n")
+                def gen_image(p=prompt):
+                    try:
+                        img = generate_image(p)
+                        self.Window.after(0, self._show_image, img, p)
+                    except Exception as e:
+                        self.Window.after(0, self._append, "system", f"Image error: {e}\n")
+                threading.Thread(target=gen_image, daemon=True).start()
+
+        elif msg == "/keywords":
+            if not self.chat_history:
+                self._append("system", "No chat history yet. Start chatting first!\n")
+            else:
+                keywords = extract_keywords(self.chat_history)
+                if keywords:
+                    result = "  🔑 Top Keywords:\n"
+                    for word, count in keywords:
+                        result += f"     {word}: {count}x\n"
+                    self._append("system", result)
+                else:
+                    self._append("system", "Not enough words to extract keywords.\n")
+
+        elif msg == "/summary":
+            if not self.chat_history:
+                self._append("system", "No chat history yet. Start chatting first!\n")
+            else:
+                summary = generate_summary(self.chat_history)
+                self._append("system", f"  📝 Chat Summary:\n     {summary}\n")
 
         elif msg.startswith("?"):
             term = msg[1:].strip()
@@ -365,6 +452,22 @@ class GUI:
             self._update_status()
         else:
             self._append("system", "You are not currently chatting.\n")
+
+    def _show_image(self, img, prompt):
+        """Display a generated image in a popup window."""
+        popup = tk.Toplevel(self.Window)
+        popup.title(f"AI Image: {prompt[:40]}")
+        popup.configure(bg="#1a1a2e")
+        tk.Label(popup, text=f"🎨 {prompt}", bg="#1a1a2e", fg="#ce93d8",
+                 font=("Helvetica", 10, "italic"), wraplength=400).pack(pady=(10, 4))
+        photo = ImageTk.PhotoImage(img)
+        label = tk.Label(popup, image=photo, bg="#1a1a2e")
+        label.image = photo  # keep reference
+        label.pack(padx=10, pady=10)
+        tk.Button(popup, text="Close", bg="#e94560", fg="white",
+                  font=("Helvetica", 10, "bold"), relief=tk.FLAT,
+                  command=popup.destroy).pack(pady=(0, 10))
+        self._append("system", f"🎨 Image generated for: '{prompt}'\n")
 
     def _clear_chat(self):
         """Clears all messages from the chat display. Generated with pi-mono."""
