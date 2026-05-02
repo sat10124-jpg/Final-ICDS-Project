@@ -84,11 +84,28 @@ def generate_summary(messages):
 def generate_image(prompt):
     """Generate an image using Pollinations AI (free, no API key needed).
     Returns a PIL Image object."""
+    import requests
     encoded = urllib.parse.quote(prompt)
-    url = f"https://image.pollinations.ai/prompt/{encoded}?width=400&height=400&nologo=true"
-    with urllib.request.urlopen(url, timeout=30) as response:
-        image_data = response.read()
-    return Image.open(io.BytesIO(image_data))
+    seed = abs(hash(prompt)) % 99999
+    url = f"https://image.pollinations.ai/prompt/{encoded}?width=400&height=400&nologo=true&seed={seed}"
+
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://pollinations.ai/",
+        "Origin": "https://pollinations.ai"
+    })
+    # Visit main page first to get cookies
+    try:
+        session.get("https://pollinations.ai/", timeout=10)
+    except:
+        pass
+    # Request the image
+    response = session.get(url, timeout=60)
+    response.raise_for_status()
+    return Image.open(io.BytesIO(response.content))
 
 
 # States (mirroring chat_utils)
