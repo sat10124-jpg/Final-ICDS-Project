@@ -4,7 +4,8 @@
 gui.py - Extended Chat GUI
 Built on top of the provided GUI template.
 Bug fix: self.system_msg now uses = instead of += to prevent message duplication.
-Added features: sentiment analysis, chatbot, clear chat, status bar, color-coded messages.
+Added features: sentiment analysis, chatbot, clear chat, status bar, color-coded messages,
+NLP keyword extraction (YAKE), summarization (Sumy), AI image generation (Pollinations).
 """
 
 import threading
@@ -12,9 +13,8 @@ import select
 import time
 import json
 import queue
+import requests
 import socket as sock_module
-import urllib.request
-import urllib.parse
 import io
 import tkinter as tk
 from tkinter import font, ttk, simpledialog, messagebox, scrolledtext
@@ -24,14 +24,24 @@ from client_state_machine import ClientSM
 from chat_bot_client import ChatBotClient
 from textblob import TextBlob
 import nltk
-from nltk.corpus import stopwords
-from nltk.tokenize import word_tokenize
-from collections import Counter
+import yake
+from sumy.parsers.plaintext import PlaintextParser
+from sumy.nlp.tokenizers import Tokenizer
+from sumy.summarizers.luhn import LuhnSummarizer
+
+# Download required NLTK data silently
+for resource in ("punkt", "punkt_tab"):
+    try:
+        nltk.data.find(f"tokenizers/{resource}")
+    except LookupError:
+        try:
+            nltk.download(resource, quiet=True)
+        except:
+            pass
 
 
 def get_sentiment(text):
-    """Returns sentiment emoji label for a given text string.
-    Generated with pi-mono assistance."""
+    """Returns sentiment emoji label for a given text string."""
     polarity = TextBlob(text).sentiment.polarity
     if polarity > 0.1:
         return "😊 Positive"
@@ -49,63 +59,38 @@ def clear_chat(text_widget):
     text_widget.config(state=tk.DISABLED)
 
 
-def extract_keywords(messages, top_n=8):
-    """Extract top keywords from a list of chat messages using NLTK."""
-    stop_words = set(stopwords.words('english'))
-    # Add chat-specific stop words
-    stop_words.update(['bye', 'hello', 'hi', 'hey', 'ok', 'okay', 'yes', 'no', 'lol'])
-    all_words = []
-    for msg in messages:
-        tokens = word_tokenize(msg.lower())
-        words = [w for w in tokens if w.isalpha() and w not in stop_words and len(w) > 2]
-        all_words.extend(words)
-    if not all_words:
-        return []
-    return Counter(all_words).most_common(top_n)
-
-
-def generate_summary(messages):
-    """Generate a simple summary of chat messages using sentence scoring."""
+def extract_keywords(messages, top_k=8):
+    """Extract top keywords from chat messages using YAKE."""
     if not messages:
-        return "No messages to summarize."
-    stop_words = set(stopwords.words('english'))
-    # Score each message by how many non-stop words it contains
-    scored = []
-    for msg in messages:
-        tokens = word_tokenize(msg.lower())
-        score = sum(1 for w in tokens if w.isalpha() and w not in stop_words)
-        scored.append((score, msg))
-    scored.sort(reverse=True)
-    # Return top 3 most content-rich messages as summary
-    top = [msg for _, msg in scored[:3]]
-    return " | ".join(top)
+        return []
+    text = "\n".join(messages)
+    kw_extractor = yake.KeywordExtractor(lan="en", n=1, top=top_k, features=None)
+    keywords = kw_extractor.extract_keywords(text)
+    keywords_sorted = sorted(keywords, key=lambda x: x[1])
+    return [kw for kw, score in keywords_sorted[:top_k]]
+
+
+def generate_summary(messages, sentences_count=3):
+    """Generate extractive summary from chat messages using Sumy."""
+    if not messages:
+        return []
+    text = "\n".join(messages)
+    parser = PlaintextParser.from_string(text, Tokenizer("english"))
+    summarizer = LuhnSummarizer()
+    summary_sentences = summarizer(parser.document, sentences_count)
+    return [str(sentence) for sentence in summary_sentences]
 
 
 def generate_image(prompt):
     """Generate an image using Pollinations AI (free, no API key needed).
-    Returns a PIL Image object."""
-    import requests
-    encoded = urllib.parse.quote(prompt)
-    seed = abs(hash(prompt)) % 99999
-    url = f"https://image.pollinations.ai/prompt/{encoded}?width=400&height=400&nologo=true&seed={seed}"
-
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://pollinations.ai/",
-        "Origin": "https://pollinations.ai"
-    })
-    # Visit main page first to get cookies
-    try:
-        session.get("https://pollinations.ai/", timeout=10)
-    except:
-        pass
-    # Request the image
-    response = session.get(url, timeout=60)
-    response.raise_for_status()
-    return Image.open(io.BytesIO(response.content))
+    Based on teacher-provided ai_pic2.py example."""
+    clean_prompt = prompt.replace(" ", "+")
+    url = f"https://image.pollinations.ai/prompt/{clean_prompt}"
+    img_data = requests.get(url, timeout=60).content
+    filename = "generated_image.png"
+    with open(filename, "wb") as f:
+        f.write(img_data)
+    return Image.open(filename)
 
 
 # States (mirroring chat_utils)
@@ -384,8 +369,8 @@ class GUI:
                 keywords = extract_keywords(self.chat_history)
                 if keywords:
                     result = "  🔑 Top Keywords:\n"
-                    for word, count in keywords:
-                        result += f"     {word}: {count}x\n"
+                    for word in keywords:
+                        result += f"     • {word}\n"
                     self._append("system", result)
                 else:
                     self._append("system", "Not enough words to extract keywords.\n")
@@ -394,8 +379,14 @@ class GUI:
             if not self.chat_history:
                 self._append("system", "No chat history yet. Start chatting first!\n")
             else:
-                summary = generate_summary(self.chat_history)
-                self._append("system", f"  📝 Chat Summary:\n     {summary}\n")
+                sentences = generate_summary(self.chat_history)
+                if sentences:
+                    result = "  📝 Chat Summary:\n"
+                    for s in sentences:
+                        result += f"     {s}\n"
+                    self._append("system", result)
+                else:
+                    self._append("system", "Not enough messages to summarize.\n")
 
         elif msg.startswith("?"):
             term = msg[1:].strip()
