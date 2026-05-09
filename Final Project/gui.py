@@ -1,13 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-gui.py - Extended Chat GUI
-Built on top of the provided GUI template.
-Bug fix: self.system_msg now uses = instead of += to prevent message duplication.
-Added features: sentiment analysis, chatbot, clear chat, status bar, color-coded messages,
-NLP keyword extraction (YAKE), summarization (Sumy), AI image generation (Pollinations).
-"""
-
 import threading
 import select
 import time
@@ -29,7 +21,6 @@ from sumy.parsers.plaintext import PlaintextParser
 from sumy.nlp.tokenizers import Tokenizer
 from sumy.summarizers.luhn import LuhnSummarizer
 
-# Download required NLTK data silently
 for resource in ("punkt", "punkt_tab"):
     try:
         nltk.data.find(f"tokenizers/{resource}")
@@ -83,8 +74,7 @@ def generate_summary(messages, sentences_count=3):
 
 
 def generate_image(prompt):
-    """Generate an image using Pollinations AI (free, no API key needed).
-    Based on teacher-provided ai_pic2.py example."""
+    """Generate an image using Pollinations"""
     clean_prompt = prompt.replace(" ", "+")
     url = f"https://image.pollinations.ai/prompt/{clean_prompt}"
     img_data = requests.get(url, timeout=60).content
@@ -100,8 +90,7 @@ S_CHATTING = 2
 
 
 class GUI:
-    """Extended chat GUI built on the provided template.
-    Key fix: system_msg uses = not += to prevent message duplication.
+    """Key fix: system_msg uses = not += to prevent message duplication.
     """
 
     def __init__(self, send, recv, sm, s):
